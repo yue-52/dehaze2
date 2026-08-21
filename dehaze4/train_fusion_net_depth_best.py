@@ -1,0 +1,607 @@
+import os
+import argparse
+import numpy as np
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    class SummaryWriter:
+        """No-op fallback when the optional tensorboard package is unavailable."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def add_scalar(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+from torchvision.models import vgg16
+from pytorch_msssim import msssim
+
+# Imports
+from dataset import CloudRemovalDataset
+
+# Models
+from model1.model_convnext import Discriminator, fusion_net_depth_best
+#from model1.SADT_arch import SADT
+from perceptual import LossNetwork
+from loss.CR_loss import ContrastLoss as crloss
+from utils.metrics import psnr, ssim
+
+def set_train_stage(model, stage, args):
+    """
+    Configures the freezing/unfreezing of model layers based on the training stage.
+    """
+    def set_grad(module, requires_grad):
+        if module is None: return
+        for param in module.parameters():
+            param.requires_grad = requires_grad
+
+    # --- Strategy for Model fusion_net_depth_best (v13) ---
+    if args.model_version in [13, 23]:
+        print(f"==> Setting training stage to: {stage} (fusion_net_depth_best)")
+        if stage == 'depth_pretrain' and args.model_version == 23:
+            # Train geometry semantics before it is allowed to affect restoration.
+            set_grad(model, False)
+            set_grad(model.depth_branch, True)
+        elif stage == 'warmup':
+            # Freeze backbones
+            if hasattr(model, 'knowledge_adaptation_branch'):
+                 set_grad(model.knowledge_adaptation_branch, False)
+            if hasattr(model, 'depth_branch'):
+                 set_grad(model.depth_branch, False)
+            # Train Fusion and DWT
+            set_grad(model.dwt_branch, True)
+            if hasattr(model, 'fusion_router'):
+                set_grad(model.fusion_router, True)
+            if hasattr(model, 'depth_guided_modulation'):
+                set_grad(model.depth_guided_modulation, True)
+            if hasattr(model, 'base_fusion'):
+                set_grad(model.base_fusion, True)
+            if hasattr(model, 'depth_adapter'):
+                set_grad(model.depth_adapter, True)
+            set_grad(model.refine, True)
+            set_grad(model.tail, True)
+            set_grad(model.proj_dwt, True)
+            set_grad(model.proj_ka, True)
+            set_grad(model.proj_depth, True)
+            
+        elif stage == 'full_finetune':
+             set_grad(model, True)
+        else:
+             # Default to all open if unknown stage
+             set_grad(model, True)
+
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"==> Trainable params: {trainable_params:,} / {total_params:,} ({trainable_params/total_params:.1%})")
+        return model
+        
+    # Same strategy for v12 
+    if args.model_version == 12:
+        print(f"==> Setting training stage to: {stage} (Model v12)")
+        if stage == 'warmup_decoder':
+            if hasattr(model.main_model, 'encoder'):
+                print(" -> Freezing Swin Encoder")
+                set_grad(model.main_model.encoder, False)
+            print(" -> Unfreezing DWT, Depth, AuxAdapter, Bottleneck, Decoder")
+            set_grad(model.dwt_model, True)
+            set_grad(model.depth_model, True)
+            set_grad(model.main_model.aux_adapter, True)
+            set_grad(model.main_model.bottleneck, True)
+            set_grad(model.main_model.decoder, True)
+            if hasattr(model.main_model, 'fusion_gate'):
+                 set_grad(model.main_model.fusion_gate, True)
+            if hasattr(model.main_model, 'fusion_proj'):
+                 set_grad(model.main_model.fusion_proj, True)
+        elif stage == 'full_finetune':
+            print(" -> Unfreezing Entire Model")
+            set_grad(model, True)
+        
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"==> Trainable params: {trainable_params:,} / {total_params:,} ({trainable_params/total_params:.1%})")
+        return model
+
+    return model
+
+
+def train_model(model, train_dataloader, test_dataloader, device, args):
+    
+    DNet = Discriminator().to(device)  
+
+    model = set_train_stage(model, args.stage, args)
+    
+    # --- Load Teacher Depth Network (RA-Depth) --- #
+    encoder = None
+    depth_decoder = None
+    if args.use_depth:
+        print("==> Loading Teacher Depth Network (RA-Depth)...")
+        with torch.no_grad():
+            model_path = os.path.join("./depth_teachers/ra_depth", "weights")
+            if not os.path.isdir(model_path):
+                print(f"Warning: Teacher depth model not found at {model_path}. Depth loss disabled.")
+                args.use_depth = False
+            else:
+                from depth_teachers.ra_depth.networks.hrnet_encoder import hrnet18
+                from depth_teachers.ra_depth.networks.depth_decoder_msf import DepthDecoder_MSF
+
+                encoder_path = os.path.join(model_path, "encoder.pth")
+                decoder_path = os.path.join(model_path, "depth.pth")
+                encoder_dict = torch.load(encoder_path, map_location=device, weights_only=True)
+                
+                encoder = hrnet18(False)
+                depth_decoder = DepthDecoder_MSF(encoder.num_ch_enc, [0], num_output_channels=1)
+                
+                model_dict = encoder.state_dict()
+                encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
+                depth_decoder.load_state_dict(torch.load(decoder_path, map_location=device, weights_only=True))
+                
+                encoder = encoder.to(device)
+                depth_decoder = depth_decoder.to(device)
+                
+                encoder.eval()
+                depth_decoder.eval()
+                
+                for param in encoder.parameters(): param.requires_grad = False
+                for param in depth_decoder.parameters(): param.requires_grad = False
+    
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+    G_optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+    scheduler_G = torch.optim.lr_scheduler.MultiStepLR(
+        G_optimizer,
+        milestones=args.milestones_g,
+        gamma=args.lr_gamma,
+    )
+    D_optim = torch.optim.Adam(DNet.parameters(), lr=args.lr)
+    scheduler_D = torch.optim.lr_scheduler.MultiStepLR(
+        D_optim,
+        milestones=args.milestones_d,
+        gamma=args.lr_gamma,
+    )
+    
+    criterion_dehaze = nn.L1Loss() # Using simple L1 as per train5.py base
+    criterion_depth = nn.L1Loss()
+    msssim_loss_fn = msssim
+    criterion_dehaze_cr = crloss().to(device)
+
+    vgg_model = vgg16(pretrained=True).features[:16].to(device)
+    for param in vgg_model.parameters(): param.requires_grad = False
+    loss_network = LossNetwork(vgg_model).eval()
+
+    writer = SummaryWriter(os.path.join(args.save_dir, 'logs'))
+
+    best_psnr = 0.0
+    best_ssim = 0.0
+    start_epoch = 0
+    iteration = 0
+    max_synth_prob = getattr(args, 'max_synth_prob', 0.5) 
+
+    # Resume logic for Optimizer and Scheduler (if available)
+    if args.resume and os.path.exists(args.resume):
+        try:
+            checkpoint = torch.load(args.resume, map_location=device)
+            if 'optimizer_G' in checkpoint:
+                G_optimizer.load_state_dict(checkpoint['optimizer_G'])
+            if 'optimizer_D' in checkpoint:
+                D_optim.load_state_dict(checkpoint['optimizer_D'])
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+            if 'best_psnr' in checkpoint:
+                best_psnr = checkpoint['best_psnr']
+            if 'best_ssim' in checkpoint:
+                best_ssim = checkpoint['best_ssim']
+            print(f"Resumed optimizer/scheduler state from epoch {start_epoch}")
+        except Exception as e:
+            print(f"Could not load optimizer state: {e}. Starting optimizer from scratch.")
+
+    print("Starting training loop (train5.py style)...")
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        DNet.train()
+
+        progress = epoch / args.epochs
+        current_prob = max_synth_prob * (1 - progress)
+        
+        if isinstance(train_dataloader.dataset, torch.utils.data.Subset):
+            ds = train_dataloader.dataset.dataset
+        else:
+            ds = train_dataloader.dataset    
+        if hasattr(ds, 'set_synthesis_prob'):
+            ds.set_synthesis_prob(current_prob)
+
+        losses = {'total_loss': [], 'img_loss': [], 'depth_loss': []}
+
+        for batch in tqdm(train_dataloader, desc=f'Training Epoch {epoch+1}'):
+            iteration += 1
+            hazy = batch['cloud_img'].to(device)  
+            clean = batch['clear_img'].to(device)  
+            coarse_output = None
+            depth_confidence = None
+
+            # Fix for specific model versions returning tuple
+            if args.model_version == 23:
+                output, aux = model(hazy, return_aux=True)
+                depth_pred = aux['depth']
+                depth_confidence = aux['confidence']
+            elif args.model_version in [12, 13, 14, 15]:
+                res = model(hazy, return_depth=True)
+                if isinstance(res, tuple):
+                    output, depth_pred = res
+                else:
+                    output = res
+                    depth_pred = None
+            elif args.model_version == 16:
+                output = model(hazy)
+                if isinstance(output, tuple):
+                    output = output[0]
+                depth_pred = None
+            elif args.model_version == 20:          
+                res = model(hazy)
+                if isinstance(res, dict):
+                    output = res['dehazed']         
+                    depth_pred = res.get('depth', None)
+                else:
+                    output = res
+                    depth_pred = None
+            elif args.model_version == 22:
+                output, aux = model(hazy, return_aux=True)
+                coarse_output = aux['coarse']
+                depth_pred = None
+            else:
+                output = model(hazy)
+                depth_pred = None
+
+            # --- Discriminator Step ---
+            D_optim.zero_grad(set_to_none=True)
+            real_out = DNet(clean).mean()
+            fake_out = DNet(output.detach()).mean()
+            D_loss = 1 - real_out + fake_out
+            D_loss.backward()
+            D_optim.step()
+
+            # --- Generator Step ---
+            G_optimizer.zero_grad(set_to_none=True)
+            fake_out_new = DNet(output).mean()
+            adversarial_loss = torch.mean(1 - fake_out_new)
+            
+            smooth_loss_l1 = F.smooth_l1_loss(output, clean)
+            perceptual_loss = loss_network(output, clean)
+            msssim_loss_val = -msssim_loss_fn(output, clean, normalize=True)
+            contrast_loss = criterion_dehaze_cr(output, clean, hazy) if args.contrast_weight > 0 else torch.tensor(0.0, device=device)
+            coarse_loss = (
+                F.smooth_l1_loss(coarse_output, clean)
+                if coarse_output is not None
+                else torch.tensor(0.0, device=device)
+            )
+            
+            loss_total_depth = torch.tensor(0.0).to(device)
+            if args.use_depth and encoder is not None and depth_pred is not None:
+                if depth_pred.shape[1] != 1:
+                    depth_pred = res['depth']
+                with torch.no_grad():
+                    real_img_2_depth_map = depth_decoder(encoder(clean))[("disp", 0)]
+                
+                if depth_pred.shape != real_img_2_depth_map.shape:
+                    depth_pred_resized = F.interpolate(depth_pred, size=real_img_2_depth_map.shape[2:], mode='bilinear', align_corners=False)
+                else:
+                    depth_pred_resized = depth_pred
+
+                if args.model_version == 23:
+                    # Give difficult restoration regions more weight without the
+                    # vanishing 1/(H*W) scale caused by a global pixel softmax.
+                    error_weight = torch.abs(output.detach() - clean).mean(dim=1, keepdim=True)
+                    error_weight = error_weight / (
+                        error_weight.mean(dim=(2, 3), keepdim=True) + 1e-6
+                    )
+                    error_weight = 1.0 + 0.5 * error_weight
+                    error_weight = F.interpolate(
+                        error_weight,
+                        size=depth_pred_resized.shape[2:],
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                    depth_error = torch.abs(depth_pred_resized - real_img_2_depth_map)
+                    loss_depth_direct = depth_error.mean()
+                    loss_depth_weighted = (error_weight * depth_error).mean()
+
+                    pred_dx = depth_pred_resized[:, :, :, 1:] - depth_pred_resized[:, :, :, :-1]
+                    pred_dy = depth_pred_resized[:, :, 1:, :] - depth_pred_resized[:, :, :-1, :]
+                    target_dx = real_img_2_depth_map[:, :, :, 1:] - real_img_2_depth_map[:, :, :, :-1]
+                    target_dy = real_img_2_depth_map[:, :, 1:, :] - real_img_2_depth_map[:, :, :-1, :]
+                    loss_depth_gradient = F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy)
+
+                    confidence = F.interpolate(
+                        depth_confidence,
+                        size=depth_pred_resized.shape[2:],
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                    confidence_target = torch.exp(-5.0 * depth_error.detach())
+                    loss_confidence = F.binary_cross_entropy(
+                        confidence.clamp(1e-5, 1.0 - 1e-5), confidence_target
+                    )
+                    loss_total_depth = (
+                        loss_depth_direct
+                        + loss_depth_weighted
+                        + 0.5 * loss_depth_gradient
+                        + 0.1 * loss_confidence
+                    )
+                else:
+                    diff_dehaze = torch.sub(output, clean)
+                    B, C, H, W = diff_dehaze.shape
+                    diff_dehaze_flat = diff_dehaze.permute(0, 2, 3, 1).reshape(B, -1)
+                    diff_d_w = F.softmax(diff_dehaze_flat, dim=-1) + 1e-7
+                    diff_d_w = diff_d_w.reshape(B, H, W, C).permute(0, 3, 1, 2)
+                    diff_dehaze_w = torch.sum(diff_d_w, dim=1, keepdim=True)
+
+                    if diff_dehaze_w.shape[2:] != depth_pred_resized.shape[2:]:
+                         diff_dehaze_w = F.interpolate(diff_dehaze_w, size=depth_pred_resized.shape[2:], mode='bilinear', align_corners=False)
+
+                    weighted_depth_output = depth_pred_resized * diff_dehaze_w
+                    weighted_teacher_depth = real_img_2_depth_map * diff_dehaze_w
+                    loss_depth_weighted = criterion_depth(weighted_depth_output, weighted_teacher_depth)
+                    loss_depth_direct = criterion_depth(depth_pred_resized, real_img_2_depth_map)
+                    loss_total_depth = loss_depth_weighted + loss_depth_direct
+
+            total_loss = smooth_loss_l1 + \
+                         args.perceptual_weight * perceptual_loss + \
+                         args.adv_weight * adversarial_loss + \
+                         args.msssim_weight * msssim_loss_val + \
+                         args.contrast_weight * contrast_loss + \
+                         args.coarse_weight * coarse_loss + \
+                         args.depth_weight * loss_total_depth
+
+            # NaN Check to prevent crash/corruption
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print(f"[Warning] NaN/Inf detected at epoch {epoch+1}. Skipping batch.")
+                G_optimizer.zero_grad(set_to_none=True)
+                continue
+            
+            # Standard Backward (No AMP)
+            try:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Clip grad to stabilize
+                G_optimizer.step()
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"[Warning] OOM in backward/step. Clearing cache.")
+                    torch.cuda.empty_cache()
+                    G_optimizer.zero_grad(set_to_none=True)
+                    continue
+                else:
+                    raise e
+
+            losses['total_loss'].append(total_loss.item())
+            losses['img_loss'].append(smooth_loss_l1.item())
+            if args.use_depth:
+                losses['depth_loss'].append(loss_total_depth.item())
+
+            writer.add_scalar('Loss/total', total_loss.item(), iteration)
+            writer.add_scalar('Loss/img_l1', smooth_loss_l1.item(), iteration)
+
+        print(f'Epoch {epoch + 1}/{args.epochs} | '
+              f'Total: {np.mean(losses["total_loss"]):.4f} | '
+              f'Img: {np.mean(losses["img_loss"]):.4f}')
+
+        # Save last model periodically
+        if (epoch + 1) % args.save_cycle == 0:
+             torch.save(model.state_dict(), os.path.join(args.save_dir, f'dehaze_last.pth'))
+
+        # Evaluation
+        val_psnr, val_ssim = evaluate(model, test_dataloader, device)
+        writer.add_scalar('Metrics/PSNR', val_psnr, epoch)
+        writer.add_scalar('Metrics/SSIM', val_ssim, epoch)
+        print(f'Validation - PSNR: {val_psnr:.4f}, SSIM: {val_ssim:.4f}')
+
+        # Save Best PSNR/SSIM
+        if val_psnr > best_psnr:
+            best_psnr = val_psnr
+            torch.save(model.state_dict(), os.path.join(args.save_dir, 'best_psnr.pth'))
+            print('Saving best PSNR model...')
+            
+        if val_ssim > best_ssim:
+            best_ssim = val_ssim
+            torch.save(model.state_dict(), os.path.join(args.save_dir, 'best_ssim.pth'))
+            print('Saving best SSIM model...')
+
+        # Step schedulers once per epoch to match epoch-based milestones.
+        scheduler_G.step()
+        scheduler_D.step()
+        current_lr_g = G_optimizer.param_groups[0]['lr']
+        current_lr_d = D_optim.param_groups[0]['lr']
+        writer.add_scalar('LR/G', current_lr_g, epoch)
+        writer.add_scalar('LR/D', current_lr_d, epoch)
+        print(f'LR - G: {current_lr_g:.8f}, D: {current_lr_d:.8f}')
+            
+        # Optional: Save checkpoint with optimizer state for resuming
+        if (epoch + 1) % 500 == 0:
+            checkpoint = {
+                'epoch': epoch,
+                'state_dict': model.state_dict(),
+                'optimizer_G': G_optimizer.state_dict(),
+                'optimizer_D': D_optim.state_dict(),
+                'best_psnr': best_psnr,
+                'best_ssim': best_ssim
+            }
+            torch.save(checkpoint, os.path.join(args.save_dir, f'checkpoint_epoch{epoch+1}.pth'))
+
+    writer.close()
+    print('\nTrain Complete.\n')
+
+
+def evaluate(model, test_dataloader, device):
+    model.eval()
+    psnr_meter = []
+    ssim_meter = []
+    
+    with torch.no_grad():
+        for batch in tqdm(test_dataloader, desc='Evaluating'):
+            cloud_imgs = batch['cloud_img'].to(device)
+            clear_imgs = batch['clear_img'].to(device)
+            
+            # Inference
+            res = model(cloud_imgs)
+            if isinstance(res, dict):
+                res = res['dehazed']
+            elif isinstance(res, tuple):
+                res = res[0]
+            if isinstance(res, tuple): res = res[0]
+            
+            res = torch.clamp(res, 0, 1) # Ensure valid range
+            clear_imgs = torch.clamp(clear_imgs, 0, 1)
+            
+            # Simple batch loop for metrics
+            # Calculate metrics per image in batch
+            for i in range(len(res)):
+                p = psnr(res[i], clear_imgs[i])
+                psnr_meter.append(p)
+                
+                # Check for dims for SSIM (needs 4D usually or handle 3D)
+                # ssim function from utils.metrics
+                s = ssim(res[i].unsqueeze(0), clear_imgs[i].unsqueeze(0)).item()
+                ssim_meter.append(s)
+                
+    return np.mean(psnr_meter), np.mean(ssim_meter) if ssim_meter else 0.0
+
+
+def main(args):
+    total_dataset = CloudRemovalDataset(os.path.join(args.data_dir), args.nor, crop_size=args.crop_size)
+
+    generator = torch.Generator().manual_seed(22)
+    train_set, test_set = random_split(
+        total_dataset,
+        [int(len(total_dataset) * 0.9), len(total_dataset) - int(len(total_dataset) * 0.9)],
+        generator=generator
+    )
+
+    train_loader = DataLoader(train_set, batch_size=args.batch_size,
+                              shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    test_loader = DataLoader(test_set, batch_size=1, # BS=1 for accurate metrics during eval
+                             shuffle=False, num_workers=4, pin_memory=True)
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    print(f'Using device: {device}')
+
+    if args.model_version == 12:
+        model = fusion_net12().to(device)
+    elif args.model_version == 1:
+        model = fusion_net_1().to(device)
+    elif args.model_version == 13:
+        # fusion_net_depth_best
+        model = fusion_net_depth_best(crop_size=args.crop_size).to(device)
+    elif args.model_version == 14:
+        # fusion_net_depth_best
+        model = fusion_net_depth_best_res(crop_size=args.crop_size, backbone='resnet34').to(device)
+    elif args.model_version == 15:
+        # fusion_net_depth_best
+        from model1.model_vssm import fusion_net_depth_best_mamba
+        model = fusion_net_depth_best_mamba(crop_size=args.crop_size, backbone='visionmamba').to(device)
+    elif args.model_version == 16:
+        # fusion_net_depth_best
+        model = SADT(in_channels=3,window_size=8,use_bias=True,reduction=4,out_channels=3).to(device)
+    elif args.model_version == 17:
+        # fusion_net_depth_best
+        model = fusion_net_depth_best_light(crop_size=args.crop_size).to(device)
+    elif args.model_version == 18:
+        # fusion_net_depth_best
+        model = fusion_net_depth_best_v2(crop_size=args.crop_size).to(device)
+    elif args.model_version == 19:
+        # fusion_net_depth_best
+        model = fusion_net_depth_best_v3(crop_size=args.crop_size).to(device)
+    elif args.model_version == 20:
+        # fusion_net_depth_best
+        model = SADGDehazeV3(pretrained=True).to(device)
+    elif args.model_version == 21:
+        model = fusion_net_real_lite(crop_size=args.crop_size).to(device)
+    elif args.model_version == 22:
+        model = fusion_net_real_lite_v2(crop_size=args.crop_size).to(device)
+    elif args.model_version == 23:
+        model = fusion_net_depth_geometry_v1(crop_size=args.crop_size).to(device)
+    else:
+        # Fallback list or logic
+        if args.model_version == 11: model = fusion_net11().to(device)
+        else: model = fusion_net_depth_best(crop_size=args.crop_size).to(device)
+
+    if args.resume is not None:
+        if os.path.exists(args.resume):
+            print(f'Resume from {args.resume}')
+            # Loading weights flexibly
+            checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
+            if 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+        else:
+            print(f'Checkpoint {args.resume} not found, starting from scratch.')
+
+    train_model(model, train_loader, test_loader, device, args)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='DehazeXL Train V5 Style (Restored)')
+    parser.add_argument('--data_dir', type=str, default=r"/newhome/zhangbaoguo/project1/Dense-HAZE/train/",
+                        help='Path to dataset')
+    parser.add_argument('--save_dir', type=str, default=r'./checkpoints/dense',
+                        help='Path to save checkpoints')
+    parser.add_argument('--save_cycle', type=int, default=100,
+                        help='Cycle of saving checkpoint (epoch)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint file to resume')
+    parser.add_argument('--lr', type=float, default=0.0001,
+                        help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=2,
+                        help='Batch size')
+    parser.add_argument('--no-cuda', action='store_true', default=False,
+                        help='Disable CUDA')
+    parser.add_argument('--epochs', type=int, default=2000,
+                        help='Epochs')
+    parser.add_argument('--nor', action='store_true',
+                        help='Normalize the image')
+    parser.add_argument('--crop_size', type=int, default=512,
+                        help='Crop size')
+    parser.add_argument('--model_version', type=int, choices=[13], default=13,
+                        help='Only version 13 (fusion_net_depth_best) is retained')
+    parser.add_argument('--stage', type=str, default='full_finetune',
+                        help='Training stage')
+    parser.add_argument('--depth_weight', type=float, default=0.1,
+                        help='Weight for depth loss')
+    parser.add_argument('--use_depth', dest='use_depth', action='store_true',
+                        help='Use depth network')
+    parser.add_argument('--no_use_depth', dest='use_depth', action='store_false',
+                        help='Disable depth network')
+    parser.set_defaults(use_depth=True)
+
+    parser.add_argument('--perceptual_weight', type=float, default=0.01,
+                        help='Weight for perceptual loss')
+    parser.add_argument('--adv_weight', type=float, default=0.0005,
+                        help='Weight for adversarial loss')
+    parser.add_argument('--msssim_weight', type=float, default=0.2,
+                        help='Weight for MS-SSIM loss')
+    parser.add_argument('--contrast_weight', type=float, default=0.0,
+                        help='Weight for contrastive loss (0 disables it)')
+    parser.add_argument('--coarse_weight', type=float, default=0.2,
+                        help='Weight for V22 coarse restoration supervision')
+    parser.add_argument('--milestones_g', type=int, nargs='+', default=[3000, 5000, 8000],
+                        help='Epoch milestones for generator LR decay')
+    parser.add_argument('--milestones_d', type=int, nargs='+', default=[5000, 7000, 8000],
+                        help='Epoch milestones for discriminator LR decay')
+    parser.add_argument('--lr_gamma', type=float, default=0.5,
+                        help='LR decay factor for MultiStepLR')
+    parser.add_argument('--max_synth_prob', type=float, default=0.5,
+                        help='Maximum synthesis probability for data augmentation')
+    
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+        
+    main(args)
+
