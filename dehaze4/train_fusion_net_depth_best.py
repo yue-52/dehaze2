@@ -43,9 +43,9 @@ def set_train_stage(model, stage, args):
             param.requires_grad = requires_grad
 
     # --- Strategy for Model fusion_net_depth_best (v13) ---
-    if args.model_version in [13, 23]:
+    if args.model_version in [13, 15, 23]:
         print(f"==> Setting training stage to: {stage} (fusion_net_depth_best)")
-        if stage == 'depth_pretrain' and args.model_version == 23:
+        if stage == 'depth_pretrain' and args.model_version in [15, 23]:
             # Train geometry semantics before it is allowed to affect restoration.
             set_grad(model, False)
             set_grad(model.depth_branch, True)
@@ -567,8 +567,8 @@ if __name__ == '__main__':
                         help='Normalize the image')
     parser.add_argument('--crop_size', type=int, default=512,
                         help='Crop size')
-    parser.add_argument('--model_version', type=int, choices=[13], default=13,
-                        help='Only version 13 (fusion_net_depth_best) is retained')
+    parser.add_argument('--model_version', type=int, choices=[13, 15, 23], default=13,
+                        help='13: baseline, 15: Mamba depth-gated, 23: geometry depth-gated')
     parser.add_argument('--stage', type=str, default='full_finetune',
                         help='Training stage')
     parser.add_argument('--depth_weight', type=float, default=0.1,
@@ -604,4 +604,3 @@ if __name__ == '__main__':
         os.makedirs(args.save_dir)
         
     main(args)
-
