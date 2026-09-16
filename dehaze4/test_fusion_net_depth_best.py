@@ -252,6 +252,10 @@ def postprocess_prediction(x, output_range="clamp"):
     return torch.clamp(x, 0, 1)
 
 
+def clear_to_model_domain(clear_unit):
+    return clear_unit * 2.0 - 1.0
+
+
 def _calc_ssim_legacy_nhaze(pred, clear):
     # Keep the historical NH-HAZE SSIM protocol used by earlier test scripts.
     _, _, h, w = pred.size()
@@ -294,7 +298,7 @@ def _resolve_eval_defaults(args):
         if args.tta_mode is None:
             args.tta_mode = "hvflip"
         if args.output_range is None:
-            args.output_range = "clamp"
+            args.output_range = "unit_interval"
         args.metric_clamp = True
 
 
@@ -446,8 +450,11 @@ def run_single_model(model_name, args, device, loader, checkpoint_path):
     elif pad_multiple != args.pad_multiple:
         print(f"[Info] {model_name}: using effective pad_multiple={pad_multiple} for inference.")
 
-    times, psnrs, ssims = [], [], []
-    ssims_full, ssims_legacy = [], []
+    times = []
+    psnrs_post, ssims_post = [], []
+    ssims_post_full, ssims_post_legacy = [], []
+    psnrs_raw, ssims_raw = [], []
+    ssims_raw_full, ssims_raw_legacy = [], []
     per_image_rows = []
     custom_tta_weights = _parse_tta_weights(args.tta_weights)
     effective_tta_weights = None
@@ -460,10 +467,14 @@ def run_single_model(model_name, args, device, loader, checkpoint_path):
                 "image": filename,
                 "ok": 1,
                 "time_s": None,
-                "psnr": None,
-                "ssim": None,
-                "ssim_full": None,
-                "ssim_legacy_nhaze": None,
+                "psnr_post": None,
+                "ssim_post": None,
+                "ssim_post_full": None,
+                "ssim_post_legacy_nhaze": None,
+                "psnr_raw": None,
+                "ssim_raw": None,
+                "ssim_raw_full": None,
+                "ssim_raw_legacy_nhaze": None,
                 "error": "",
             }
             try:
@@ -486,7 +497,10 @@ def run_single_model(model_name, args, device, loader, checkpoint_path):
 
                 pred_raw = crop_image(pred_pad, h, w)
                 pred_vis = postprocess_prediction(pred_raw, output_range=args.output_range)
-                pred_metric = pred_vis if args.metric_clamp else pred_raw
+                pred_metric_post = pred_vis if args.metric_clamp else pred_raw
+                clear_metric_post = clear
+                pred_metric_raw = pred_raw
+                clear_metric_raw = clear_to_model_domain(clear_metric_post)
 
                 save_image(pred_vis, os.path.join(str(model_out_dir), filename))
 
@@ -495,17 +509,33 @@ def run_single_model(model_name, args, device, loader, checkpoint_path):
                 times.append(dt)
 
                 if bool(has_clear.item()):
-                    p = float(psnr(pred_metric, clear))
-                    row["psnr"] = p
-                    psnrs.append(p)
+                    p_post = float(psnr(pred_metric_post, clear_metric_post))
+                    row["psnr_post"] = p_post
+                    psnrs_post.append(p_post)
 
-                    ssim_val, ssim_full, ssim_legacy = compute_ssim(pred_metric, clear, args.ssim_mode)
-                    row["ssim"] = ssim_val
-                    row["ssim_full"] = ssim_full
-                    row["ssim_legacy_nhaze"] = ssim_legacy
-                    ssims.append(ssim_val)
-                    ssims_full.append(ssim_full)
-                    ssims_legacy.append(ssim_legacy)
+                    ssim_post, ssim_post_full, ssim_post_legacy = compute_ssim(
+                        pred_metric_post, clear_metric_post, args.ssim_mode
+                    )
+                    row["ssim_post"] = ssim_post
+                    row["ssim_post_full"] = ssim_post_full
+                    row["ssim_post_legacy_nhaze"] = ssim_post_legacy
+                    ssims_post.append(ssim_post)
+                    ssims_post_full.append(ssim_post_full)
+                    ssims_post_legacy.append(ssim_post_legacy)
+
+                    p_raw = float(psnr(pred_metric_raw, clear_metric_raw))
+                    row["psnr_raw"] = p_raw
+                    psnrs_raw.append(p_raw)
+
+                    ssim_raw, ssim_raw_full, ssim_raw_legacy = compute_ssim(
+                        pred_metric_raw, clear_metric_raw, args.ssim_mode
+                    )
+                    row["ssim_raw"] = ssim_raw
+                    row["ssim_raw_full"] = ssim_raw_full
+                    row["ssim_raw_legacy_nhaze"] = ssim_raw_legacy
+                    ssims_raw.append(ssim_raw)
+                    ssims_raw_full.append(ssim_raw_full)
+                    ssims_raw_legacy.append(ssim_raw_legacy)
             except Exception as e:
                 row["ok"] = 0
                 row["error"] = str(e)
@@ -529,10 +559,14 @@ def run_single_model(model_name, args, device, loader, checkpoint_path):
                 "image",
                 "ok",
                 "time_s",
-                "psnr",
-                "ssim",
-                "ssim_full",
-                "ssim_legacy_nhaze",
+                "psnr_post",
+                "ssim_post",
+                "ssim_post_full",
+                "ssim_post_legacy_nhaze",
+                "psnr_raw",
+                "ssim_raw",
+                "ssim_raw_full",
+                "ssim_raw_legacy_nhaze",
                 "error",
             ],
         )
@@ -546,10 +580,14 @@ def run_single_model(model_name, args, device, loader, checkpoint_path):
         "num_images": len(per_image_rows),
         "num_success": int(sum(r["ok"] for r in per_image_rows)),
         "avg_time_s": float(np.mean(times)) if times else None,
-        "avg_psnr": float(np.mean(psnrs)) if psnrs else None,
-        "avg_ssim": float(np.mean(ssims)) if ssims else None,
-        "avg_ssim_full": float(np.mean(ssims_full)) if ssims_full else None,
-        "avg_ssim_legacy_nhaze": float(np.mean(ssims_legacy)) if ssims_legacy else None,
+        "avg_psnr_post": float(np.mean(psnrs_post)) if psnrs_post else None,
+        "avg_ssim_post": float(np.mean(ssims_post)) if ssims_post else None,
+        "avg_ssim_post_full": float(np.mean(ssims_post_full)) if ssims_post_full else None,
+        "avg_ssim_post_legacy_nhaze": float(np.mean(ssims_post_legacy)) if ssims_post_legacy else None,
+        "avg_psnr_raw": float(np.mean(psnrs_raw)) if psnrs_raw else None,
+        "avg_ssim_raw": float(np.mean(ssims_raw)) if ssims_raw else None,
+        "avg_ssim_raw_full": float(np.mean(ssims_raw_full)) if ssims_raw_full else None,
+        "avg_ssim_raw_legacy_nhaze": float(np.mean(ssims_raw_legacy)) if ssims_raw_legacy else None,
         "ssim_mode": args.ssim_mode,
         "metric_clamp": bool(args.metric_clamp),
         "eval_profile": args.eval_profile,
@@ -662,7 +700,9 @@ def main():
             all_summaries.append(summary)
             print(
                 f"{model_name} | time={summary['avg_time_s']} | "
-                f"PSNR={summary['avg_psnr']} | SSIM={summary['avg_ssim']} | profile={summary['eval_profile']}"
+                f"post_PSNR={summary['avg_psnr_post']} | post_SSIM={summary['avg_ssim_post']} | "
+                f"raw_PSNR={summary['avg_psnr_raw']} | raw_SSIM={summary['avg_ssim_raw']} | "
+                f"profile={summary['eval_profile']}"
             )
         except Exception as e:
             print(f"[Failed] {model_name}: {e}")
@@ -688,10 +728,14 @@ def main():
         "num_images",
         "num_success",
         "avg_time_s",
-        "avg_psnr",
-        "avg_ssim",
-        "avg_ssim_full",
-        "avg_ssim_legacy_nhaze",
+        "avg_psnr_post",
+        "avg_ssim_post",
+        "avg_ssim_post_full",
+        "avg_ssim_post_legacy_nhaze",
+        "avg_psnr_raw",
+        "avg_ssim_raw",
+        "avg_ssim_raw_full",
+        "avg_ssim_raw_legacy_nhaze",
         "ssim_mode",
         "metric_clamp",
         "eval_profile",
@@ -717,4 +761,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

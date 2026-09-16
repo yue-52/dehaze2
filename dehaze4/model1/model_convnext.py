@@ -2192,6 +2192,13 @@ class AdaptiveTriBranchFusion(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(channels, 3, kernel_size=1, bias=True)
         )
+        # Dynamic spatial-aware branch routing
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, 3, kernel_size=1, bias=True)
+        )
+        self.global_spatial_blend = 0.5
 
     def forward(self, feat_dwt, feat_ka, feat_depth):
         feat_cat = torch.cat([feat_dwt, feat_ka, feat_depth], dim=1)
@@ -2201,6 +2208,7 @@ class AdaptiveTriBranchFusion(nn.Module):
 
         dynamic_w = self.dynamic_gate(feat_cat).view(feat_cat.size(0), 3)
         dynamic_w = F.softmax(dynamic_w, dim=1)
+        spatial_w = F.softmax(self.spatial_gate(feat_cat), dim=1)
 
         # Blend static global priors and dynamic sample-aware routing.
         w1 = 0.5 * static_w[0] + 0.5 * dynamic_w[:, 0]
@@ -2210,6 +2218,10 @@ class AdaptiveTriBranchFusion(nn.Module):
         w1 = w1.view(-1, 1, 1, 1)
         w2 = w2.view(-1, 1, 1, 1)
         w3 = w3.view(-1, 1, 1, 1)
+
+        w1 = self.global_spatial_blend * w1 + (1.0 - self.global_spatial_blend) * spatial_w[:, 0:1]
+        w2 = self.global_spatial_blend * w2 + (1.0 - self.global_spatial_blend) * spatial_w[:, 1:2]
+        w3 = self.global_spatial_blend * w3 + (1.0 - self.global_spatial_blend) * spatial_w[:, 2:3]
 
         fused = w1 * feat_dwt + w2 * feat_ka + w3 * feat_depth
         return fused
@@ -2226,10 +2238,21 @@ class DepthGuidedSpatialModulation(nn.Module):
             nn.Conv2d(channels // 2, 1, kernel_size=1, padding=0, bias=True),
             nn.Sigmoid()
         )
+        self.reliability_scale = 3.0
 
     def forward(self, fused_feat, depth_feat):
         depth_attn = self.depth_to_attn(depth_feat)
-        return fused_feat * (1.0 + depth_attn)
+
+        depth_grad_x = torch.abs(depth_feat[:, :, :, 1:] - depth_feat[:, :, :, :-1])
+        depth_grad_y = torch.abs(depth_feat[:, :, 1:, :] - depth_feat[:, :, :-1, :])
+        depth_grad_x = F.pad(depth_grad_x, (0, 1, 0, 0), mode='replicate')
+        depth_grad_y = F.pad(depth_grad_y, (0, 0, 0, 1), mode='replicate')
+        depth_grad = (depth_grad_x + depth_grad_y).mean(dim=1, keepdim=True)
+        depth_grad = depth_grad / (depth_grad.mean(dim=(2, 3), keepdim=True) + 1e-6)
+        reliability = torch.exp(-self.reliability_scale * depth_grad)
+
+        gated_attn = depth_attn * reliability
+        return fused_feat * (1.0 + gated_attn)
 
 
 class fusion_net11(nn.Module):
@@ -2506,16 +2529,28 @@ class fusion_net_depth_best(nn.Module):
     3. Depth Estimation Branch (for geometric layout / innovation)
     4. Adaptive Fusion (for smart combination)
     """
-    def __init__(self, crop_size: int = 256, mlp_ratio: int = 4):
+    def __init__(
+            self,
+            crop_size: int = 256,
+            mlp_ratio: int = 4,
+            semantic_backbone: str = "lightweight_v2",
+    ):
         super(fusion_net_depth_best, self).__init__()
         self.crop_size = crop_size
+        self.semantic_backbone = semantic_backbone
         
         # 1. DWT Branch (Frequency) - Output: 3 channels
         self.dwt_branch = dwt_ffc_UNet2()
         
         # 2. Knowledge Adaptation (Semantic) - Output: 28 channels
-        # CRITICAL: Using the strong ConvNeXt backbone instead of DehazeXL
-        self.knowledge_adaptation_branch = knowledge_adaptation_convnext()
+        if semantic_backbone == "convnext":
+            self.knowledge_adaptation_branch = knowledge_adaptation_convnext()
+        elif semantic_backbone == "lightweight":
+            self.knowledge_adaptation_branch = LightweightSemanticBranch(out_channels=28)
+        elif semantic_backbone == "lightweight_v2":
+            self.knowledge_adaptation_branch = LightweightSemanticBranchV2(out_channels=28)
+        else:
+            raise ValueError(f"Unsupported semantic_backbone: {semantic_backbone}")
         
         # 3. Depth Branch (Geometric) - Output: 1 channel
         self.depth_branch = DepthNet.DN()
@@ -2536,6 +2571,12 @@ class fusion_net_depth_best(nn.Module):
             nn.Conv2d(1, embed_dim, kernel_size=3, padding=1, bias=False), # Depth is 1 channel
             nn.BatchNorm2d(embed_dim),
             nn.ReLU(inplace=True)
+        )
+        self.depth_confidence_head = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim // 2, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embed_dim // 2, 1, kernel_size=1, bias=True),
+            nn.Sigmoid()
         )
         
         # Adaptive Fusion Module (similar to fusion_net11)
@@ -2559,7 +2600,7 @@ class fusion_net_depth_best(nn.Module):
             nn.Tanh() # Output -1 to 1
         )
 
-    def forward(self, input, return_depth=False):
+    def forward(self, input, return_depth=False, return_aux=False):
         # 1. Forward Pass Branches
         dwt_out = self.dwt_branch(input)                    # [B, 3, H, W]
         ka_out = self.knowledge_adaptation_branch(input)    # [B, 28, H, W]
@@ -2575,6 +2616,7 @@ class fusion_net_depth_best(nn.Module):
         feat_dwt = self.proj_dwt(dwt_out)
         feat_ka = self.proj_ka(ka_out)
         feat_depth = self.proj_depth(depth_out)
+        depth_confidence = self.depth_confidence_head(feat_depth)
         
         # 4. Adaptive Fusion of the 3 branches
         fused = self.fusion_router(feat_dwt, feat_ka, feat_depth)
@@ -2587,6 +2629,8 @@ class fusion_net_depth_best(nn.Module):
         fused = self.refine(fused)
         out = self.tail(fused)
         
+        if return_aux:
+            return out, {"depth": depth_out, "confidence": depth_confidence}
         if return_depth:
             return out, depth_out
         return out

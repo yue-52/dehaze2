@@ -5,7 +5,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
@@ -32,6 +32,34 @@ from model1.model_convnext import Discriminator, fusion_net_depth_best
 from perceptual import LossNetwork
 from loss.CR_loss import ContrastLoss as crloss
 from utils.metrics import psnr, ssim
+
+NORM_MEAN = torch.tensor([0.45837133, 0.47633536, 0.44432645]).view(1, 3, 1, 1)
+NORM_STD = torch.tensor([0.16936361, 0.15927625, 0.15468806]).view(1, 3, 1, 1)
+
+
+def to_unit_interval(x, is_normalized):
+    if not is_normalized:
+        return torch.clamp(x, 0.0, 1.0)
+    mean = NORM_MEAN.to(device=x.device, dtype=x.dtype)
+    std = NORM_STD.to(device=x.device, dtype=x.dtype)
+    return torch.clamp(x * std + mean, 0.0, 1.0)
+
+
+def unit_interval_to_tanh(x):
+    return x * 2.0 - 1.0
+
+
+def model_output_to_unit_interval(x):
+    return torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
+
+
+def depth_gradient_l1(pred, target):
+    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+    target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+    return F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy)
+
 
 def set_train_stage(model, stage, args):
     """
@@ -71,6 +99,14 @@ def set_train_stage(model, stage, args):
             set_grad(model.proj_ka, True)
             set_grad(model.proj_depth, True)
             
+        elif stage == 'depth_warmup':
+            set_grad(model, False)
+            if hasattr(model, 'depth_branch'):
+               set_grad(model.depth_branch, True)
+            if hasattr(model, 'proj_depth'):
+               set_grad(model.proj_depth, True)
+            if hasattr(model, 'depth_confidence_head'):
+               set_grad(model.depth_confidence_head, True)
         elif stage == 'full_finetune':
              set_grad(model, True)
         else:
@@ -116,6 +152,7 @@ def train_model(model, train_dataloader, test_dataloader, device, args):
     DNet = Discriminator().to(device)  
 
     model = set_train_stage(model, args.stage, args)
+    active_stage = args.stage
     
     # --- Load Teacher Depth Network (RA-Depth) --- #
     encoder = None
@@ -151,9 +188,7 @@ def train_model(model, train_dataloader, test_dataloader, device, args):
                 for param in encoder.parameters(): param.requires_grad = False
                 for param in depth_decoder.parameters(): param.requires_grad = False
     
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-
-    G_optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+    G_optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler_G = torch.optim.lr_scheduler.MultiStepLR(
         G_optimizer,
         milestones=args.milestones_g,
@@ -204,6 +239,14 @@ def train_model(model, train_dataloader, test_dataloader, device, args):
     print("Starting training loop (train5.py style)...")
 
     for epoch in range(start_epoch, args.epochs):
+        if args.depth_warmup_epochs > 0:
+            target_stage = 'depth_warmup' if epoch < args.depth_warmup_epochs else 'full_finetune'
+        else:
+            target_stage = args.stage
+        if target_stage != active_stage:
+            model = set_train_stage(model, target_stage, args)
+            active_stage = target_stage
+
         model.train()
         DNet.train()
 
@@ -221,8 +264,10 @@ def train_model(model, train_dataloader, test_dataloader, device, args):
 
         for batch in tqdm(train_dataloader, desc=f'Training Epoch {epoch+1}'):
             iteration += 1
-            hazy = batch['cloud_img'].to(device)  
-            clean = batch['clear_img'].to(device)  
+            hazy = batch['cloud_img'].to(device)
+            clean = batch['clear_img'].to(device)
+            clean_unit = to_unit_interval(clean, args.nor)
+            hazy_unit = to_unit_interval(hazy, args.nor)
             coarse_output = None
             depth_confidence = None
 
@@ -231,7 +276,18 @@ def train_model(model, train_dataloader, test_dataloader, device, args):
                 output, aux = model(hazy, return_aux=True)
                 depth_pred = aux['depth']
                 depth_confidence = aux['confidence']
-            elif args.model_version in [12, 13, 14, 15]:
+            elif args.model_version == 13:
+                res = model(hazy, return_aux=True)
+                if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], dict):
+                    output, aux = res
+                    depth_pred = aux.get('depth', None)
+                    depth_confidence = aux.get('confidence', None)
+                elif isinstance(res, tuple):
+                    output, depth_pred = res[0], res[1]
+                else:
+                    output = res
+                    depth_pred = None
+            elif args.model_version in [12, 14, 15]:
                 res = model(hazy, return_depth=True)
                 if isinstance(res, tuple):
                     output, depth_pred = res
@@ -259,65 +315,65 @@ def train_model(model, train_dataloader, test_dataloader, device, args):
                 output = model(hazy)
                 depth_pred = None
 
+            output_unit = model_output_to_unit_interval(output)
+
             # --- Discriminator Step ---
             D_optim.zero_grad(set_to_none=True)
-            real_out = DNet(clean).mean()
-            fake_out = DNet(output.detach()).mean()
-            D_loss = 1 - real_out + fake_out
+            real_out = DNet(clean_unit).mean()
+            fake_out = DNet(output_unit.detach()).mean()
+            D_loss = F.relu(1.0 - real_out) + F.relu(1.0 + fake_out)
             D_loss.backward()
             D_optim.step()
 
             # --- Generator Step ---
             G_optimizer.zero_grad(set_to_none=True)
-            fake_out_new = DNet(output).mean()
-            adversarial_loss = torch.mean(1 - fake_out_new)
-            
-            smooth_loss_l1 = F.smooth_l1_loss(output, clean)
-            perceptual_loss = loss_network(output, clean)
-            msssim_loss_val = -msssim_loss_fn(output, clean, normalize=True)
-            contrast_loss = criterion_dehaze_cr(output, clean, hazy) if args.contrast_weight > 0 else torch.tensor(0.0, device=device)
+            fake_out_new = DNet(output_unit).mean()
+            adversarial_loss = -torch.mean(fake_out_new)
+             
+            smooth_loss_l1 = F.smooth_l1_loss(output_unit, clean_unit)
+            perceptual_loss = loss_network(output_unit, clean_unit)
+            msssim_loss_val = -msssim_loss_fn(output_unit, clean_unit, normalize=True)
+            contrast_loss = (
+                criterion_dehaze_cr(output_unit, clean_unit, hazy_unit)
+                if args.contrast_weight > 0 else torch.tensor(0.0, device=device)
+            )
             coarse_loss = (
-                F.smooth_l1_loss(coarse_output, clean)
+                F.smooth_l1_loss(model_output_to_unit_interval(coarse_output), clean_unit)
                 if coarse_output is not None
                 else torch.tensor(0.0, device=device)
             )
-            
+             
             loss_total_depth = torch.tensor(0.0).to(device)
+            loss_depth_abs = torch.tensor(0.0).to(device)
+            loss_depth_grad = torch.tensor(0.0).to(device)
+            loss_depth_conf = torch.tensor(0.0).to(device)
             if args.use_depth and encoder is not None and depth_pred is not None:
                 if depth_pred.shape[1] != 1:
-                    depth_pred = res['depth']
+                    depth_pred = depth_pred[:, :1]
                 with torch.no_grad():
-                    real_img_2_depth_map = depth_decoder(encoder(clean))[("disp", 0)]
-                
+                    real_img_2_depth_map = depth_decoder(encoder(clean_unit))[("disp", 0)]
+                 
                 if depth_pred.shape != real_img_2_depth_map.shape:
                     depth_pred_resized = F.interpolate(depth_pred, size=real_img_2_depth_map.shape[2:], mode='bilinear', align_corners=False)
                 else:
                     depth_pred_resized = depth_pred
 
-                if args.model_version == 23:
-                    # Give difficult restoration regions more weight without the
-                    # vanishing 1/(H*W) scale caused by a global pixel softmax.
-                    error_weight = torch.abs(output.detach() - clean).mean(dim=1, keepdim=True)
-                    error_weight = error_weight / (
-                        error_weight.mean(dim=(2, 3), keepdim=True) + 1e-6
-                    )
-                    error_weight = 1.0 + 0.5 * error_weight
-                    error_weight = F.interpolate(
-                        error_weight,
-                        size=depth_pred_resized.shape[2:],
-                        mode='bilinear',
-                        align_corners=False,
-                    )
-                    depth_error = torch.abs(depth_pred_resized - real_img_2_depth_map)
-                    loss_depth_direct = depth_error.mean()
-                    loss_depth_weighted = (error_weight * depth_error).mean()
+                depth_error = torch.abs(depth_pred_resized - real_img_2_depth_map)
+                local_error = torch.abs(output_unit.detach() - clean_unit).mean(dim=1, keepdim=True)
+                local_error = F.avg_pool2d(local_error, kernel_size=7, stride=1, padding=3)
+                local_error = local_error / (local_error.mean(dim=(2, 3), keepdim=True) + 1e-6)
+                local_error = 1.0 + 0.5 * local_error
+                local_error = F.interpolate(
+                    local_error,
+                    size=depth_pred_resized.shape[2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
 
-                    pred_dx = depth_pred_resized[:, :, :, 1:] - depth_pred_resized[:, :, :, :-1]
-                    pred_dy = depth_pred_resized[:, :, 1:, :] - depth_pred_resized[:, :, :-1, :]
-                    target_dx = real_img_2_depth_map[:, :, :, 1:] - real_img_2_depth_map[:, :, :, :-1]
-                    target_dy = real_img_2_depth_map[:, :, 1:, :] - real_img_2_depth_map[:, :, :-1, :]
-                    loss_depth_gradient = F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy)
+                loss_depth_abs = 0.5 * depth_error.mean() + 0.5 * (local_error * depth_error).mean()
+                loss_depth_grad = depth_gradient_l1(depth_pred_resized, real_img_2_depth_map)
 
+                if depth_confidence is not None:
                     confidence = F.interpolate(
                         depth_confidence,
                         size=depth_pred_resized.shape[2:],
@@ -325,31 +381,16 @@ def train_model(model, train_dataloader, test_dataloader, device, args):
                         align_corners=False,
                     )
                     confidence_target = torch.exp(-5.0 * depth_error.detach())
-                    loss_confidence = F.binary_cross_entropy(
-                        confidence.clamp(1e-5, 1.0 - 1e-5), confidence_target
+                    loss_depth_conf = F.binary_cross_entropy(
+                        confidence.clamp(1e-5, 1.0 - 1e-5),
+                        confidence_target,
                     )
-                    loss_total_depth = (
-                        loss_depth_direct
-                        + loss_depth_weighted
-                        + 0.5 * loss_depth_gradient
-                        + 0.1 * loss_confidence
-                    )
-                else:
-                    diff_dehaze = torch.sub(output, clean)
-                    B, C, H, W = diff_dehaze.shape
-                    diff_dehaze_flat = diff_dehaze.permute(0, 2, 3, 1).reshape(B, -1)
-                    diff_d_w = F.softmax(diff_dehaze_flat, dim=-1) + 1e-7
-                    diff_d_w = diff_d_w.reshape(B, H, W, C).permute(0, 3, 1, 2)
-                    diff_dehaze_w = torch.sum(diff_d_w, dim=1, keepdim=True)
 
-                    if diff_dehaze_w.shape[2:] != depth_pred_resized.shape[2:]:
-                         diff_dehaze_w = F.interpolate(diff_dehaze_w, size=depth_pred_resized.shape[2:], mode='bilinear', align_corners=False)
-
-                    weighted_depth_output = depth_pred_resized * diff_dehaze_w
-                    weighted_teacher_depth = real_img_2_depth_map * diff_dehaze_w
-                    loss_depth_weighted = criterion_depth(weighted_depth_output, weighted_teacher_depth)
-                    loss_depth_direct = criterion_depth(depth_pred_resized, real_img_2_depth_map)
-                    loss_total_depth = loss_depth_weighted + loss_depth_direct
+                loss_total_depth = (
+                    args.depth_abs_weight * loss_depth_abs +
+                    args.depth_grad_weight * loss_depth_grad +
+                    args.depth_conf_weight * loss_depth_conf
+                )
 
             total_loss = smooth_loss_l1 + \
                          args.perceptual_weight * perceptual_loss + \
@@ -386,6 +427,12 @@ def train_model(model, train_dataloader, test_dataloader, device, args):
 
             writer.add_scalar('Loss/total', total_loss.item(), iteration)
             writer.add_scalar('Loss/img_l1', smooth_loss_l1.item(), iteration)
+            writer.add_scalar('Loss/depth_abs', loss_depth_abs.item(), iteration)
+            writer.add_scalar('Loss/depth_grad', loss_depth_grad.item(), iteration)
+            writer.add_scalar('Loss/depth_conf', loss_depth_conf.item(), iteration)
+            writer.add_scalar('Loss/adv', adversarial_loss.item(), iteration)
+            writer.add_scalar('Loss/msssim', msssim_loss_val.item(), iteration)
+            writer.add_scalar('Loss/perceptual', perceptual_loss.item(), iteration)
 
         print(f'Epoch {epoch + 1}/{args.epochs} | '
               f'Total: {np.mean(losses["total_loss"]):.4f} | '
@@ -396,19 +443,24 @@ def train_model(model, train_dataloader, test_dataloader, device, args):
              torch.save(model.state_dict(), os.path.join(args.save_dir, f'dehaze_last.pth'))
 
         # Evaluation
-        val_psnr, val_ssim = evaluate(model, test_dataloader, device)
-        writer.add_scalar('Metrics/PSNR', val_psnr, epoch)
-        writer.add_scalar('Metrics/SSIM', val_ssim, epoch)
-        print(f'Validation - PSNR: {val_psnr:.4f}, SSIM: {val_ssim:.4f}')
+        val_metrics = evaluate(model, test_dataloader, device, normalized_input=args.nor)
+        writer.add_scalar('Metrics/PSNR_post', val_metrics['psnr_post'], epoch)
+        writer.add_scalar('Metrics/SSIM_post', val_metrics['ssim_post'], epoch)
+        writer.add_scalar('Metrics/PSNR_raw', val_metrics['psnr_raw'], epoch)
+        writer.add_scalar('Metrics/SSIM_raw', val_metrics['ssim_raw'], epoch)
+        print(
+            f"Validation - post(PSNR/SSIM): {val_metrics['psnr_post']:.4f}/{val_metrics['ssim_post']:.4f} | "
+            f"raw(PSNR/SSIM): {val_metrics['psnr_raw']:.4f}/{val_metrics['ssim_raw']:.4f}"
+        )
 
         # Save Best PSNR/SSIM
-        if val_psnr > best_psnr:
-            best_psnr = val_psnr
+        if val_metrics['psnr_post'] > best_psnr:
+            best_psnr = val_metrics['psnr_post']
             torch.save(model.state_dict(), os.path.join(args.save_dir, 'best_psnr.pth'))
             print('Saving best PSNR model...')
-            
-        if val_ssim > best_ssim:
-            best_ssim = val_ssim
+             
+        if val_metrics['ssim_post'] > best_ssim:
+            best_ssim = val_metrics['ssim_post']
             torch.save(model.state_dict(), os.path.join(args.save_dir, 'best_ssim.pth'))
             print('Saving best SSIM model...')
 
@@ -437,10 +489,12 @@ def train_model(model, train_dataloader, test_dataloader, device, args):
     print('\nTrain Complete.\n')
 
 
-def evaluate(model, test_dataloader, device):
+def evaluate(model, test_dataloader, device, normalized_input=False):
     model.eval()
-    psnr_meter = []
-    ssim_meter = []
+    psnr_post_meter = []
+    ssim_post_meter = []
+    psnr_raw_meter = []
+    ssim_raw_meter = []
     
     with torch.no_grad():
         for batch in tqdm(test_dataloader, desc='Evaluating'):
@@ -454,22 +508,29 @@ def evaluate(model, test_dataloader, device):
             elif isinstance(res, tuple):
                 res = res[0]
             if isinstance(res, tuple): res = res[0]
-            
-            res = torch.clamp(res, 0, 1) # Ensure valid range
-            clear_imgs = torch.clamp(clear_imgs, 0, 1)
-            
-            # Simple batch loop for metrics
-            # Calculate metrics per image in batch
+
+            pred_raw = res
+            pred_post = model_output_to_unit_interval(pred_raw)
+            clear_post = to_unit_interval(clear_imgs, normalized_input)
+            clear_raw = unit_interval_to_tanh(clear_post)
+
             for i in range(len(res)):
-                p = psnr(res[i], clear_imgs[i])
-                psnr_meter.append(p)
-                
-                # Check for dims for SSIM (needs 4D usually or handle 3D)
-                # ssim function from utils.metrics
-                s = ssim(res[i].unsqueeze(0), clear_imgs[i].unsqueeze(0)).item()
-                ssim_meter.append(s)
-                
-    return np.mean(psnr_meter), np.mean(ssim_meter) if ssim_meter else 0.0
+                p_post = psnr(pred_post[i], clear_post[i])
+                psnr_post_meter.append(p_post)
+                s_post = ssim(pred_post[i].unsqueeze(0), clear_post[i].unsqueeze(0)).item()
+                ssim_post_meter.append(s_post)
+
+                p_raw = psnr(pred_raw[i], clear_raw[i])
+                psnr_raw_meter.append(p_raw)
+                s_raw = ssim(pred_raw[i].unsqueeze(0), clear_raw[i].unsqueeze(0)).item()
+                ssim_raw_meter.append(s_raw)
+
+    return {
+        'psnr_post': float(np.mean(psnr_post_meter)) if psnr_post_meter else 0.0,
+        'ssim_post': float(np.mean(ssim_post_meter)) if ssim_post_meter else 0.0,
+        'psnr_raw': float(np.mean(psnr_raw_meter)) if psnr_raw_meter else 0.0,
+        'ssim_raw': float(np.mean(ssim_raw_meter)) if ssim_raw_meter else 0.0,
+    }
 
 
 def main(args):
@@ -482,8 +543,27 @@ def main(args):
         generator=generator
     )
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size,
-                              shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    train_sampler = None
+    if hasattr(total_dataset, 'sample_weights'):
+        train_weights = torch.as_tensor(
+            [total_dataset.sample_weights[i] for i in train_set.indices],
+            dtype=torch.double
+        )
+        train_sampler = WeightedRandomSampler(
+            weights=train_weights,
+            num_samples=len(train_weights),
+            replacement=True
+        )
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
     test_loader = DataLoader(test_set, batch_size=1, # BS=1 for accurate metrics during eval
                              shuffle=False, num_workers=4, pin_memory=True)
 
@@ -496,7 +576,10 @@ def main(args):
         model = fusion_net_1().to(device)
     elif args.model_version == 13:
         # fusion_net_depth_best
-        model = fusion_net_depth_best(crop_size=args.crop_size).to(device)
+        model = fusion_net_depth_best(
+            crop_size=args.crop_size,
+            semantic_backbone=args.semantic_backbone
+        ).to(device)
     elif args.model_version == 14:
         # fusion_net_depth_best
         model = fusion_net_depth_best_res(crop_size=args.crop_size, backbone='resnet34').to(device)
@@ -570,9 +653,21 @@ if __name__ == '__main__':
     parser.add_argument('--model_version', type=int, choices=[13], default=13,
                         help='Only version 13 (fusion_net_depth_best) is retained')
     parser.add_argument('--stage', type=str, default='full_finetune',
+                        choices=['warmup', 'depth_warmup', 'full_finetune'],
                         help='Training stage')
+    parser.add_argument('--depth_warmup_epochs', type=int, default=0,
+                        help='If >0, run depth_warmup for N epochs then switch to full_finetune')
     parser.add_argument('--depth_weight', type=float, default=0.1,
                         help='Weight for depth loss')
+    parser.add_argument('--depth_abs_weight', type=float, default=1.0,
+                        help='Weight for absolute depth consistency loss')
+    parser.add_argument('--depth_grad_weight', type=float, default=0.5,
+                        help='Weight for depth gradient consistency loss')
+    parser.add_argument('--depth_conf_weight', type=float, default=0.1,
+                        help='Weight for depth confidence calibration loss')
+    parser.add_argument('--semantic_backbone', type=str, default='lightweight_v2',
+                        choices=['convnext', 'lightweight', 'lightweight_v2'],
+                        help='Semantic branch backbone for fusion_net_depth_best')
     parser.add_argument('--use_depth', dest='use_depth', action='store_true',
                         help='Use depth network')
     parser.add_argument('--no_use_depth', dest='use_depth', action='store_false',
@@ -604,4 +699,3 @@ if __name__ == '__main__':
         os.makedirs(args.save_dir)
         
     main(args)
-

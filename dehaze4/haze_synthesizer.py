@@ -5,7 +5,7 @@ class HazeSynthesizer:
     def __init__(self):
         pass
 
-    def synthesize(self, clear_img_tensor, depth_map_tensor):
+    def synthesize(self, clear_img_tensor, depth_map_tensor, beta_range=None, gamma_range=None):
         """
         Synthesize hazy image from clear image and depth map.
 
@@ -44,8 +44,17 @@ class HazeSynthesizer:
         bs, c, h, w = clear_img_tensor.shape
         
         # Sample parameters per image in batch
-        gamma = 1.3 + (1.7 - 1.3) * torch.rand(bs, 1, 1, 1, device=device)
-        beta = 0.8 + (1.7 - 0.8) * torch.rand(bs, 1, 1, 1, device=device)
+        if gamma_range is None:
+            gamma_min, gamma_max = 1.3, 1.7
+        else:
+            gamma_min, gamma_max = gamma_range
+        if beta_range is None:
+            beta_min, beta_max = 0.8, 1.7
+        else:
+            beta_min, beta_max = beta_range
+
+        gamma = gamma_min + (gamma_max - gamma_min) * torch.rand(bs, 1, 1, 1, device=device)
+        beta = beta_min + (beta_max - beta_min) * torch.rand(bs, 1, 1, 1, device=device)
         A = 0.8 + (1.0 - 0.8) * torch.rand(bs, 1, 1, 1, device=device)
         dA = -0.025 + 0.05 * torch.rand(bs, 3, 1, 1, device=device) # 3 channel vector
 
@@ -93,4 +102,3 @@ def normalize(tensor):
     mean = torch.tensor(MEAN, device=tensor.device).view(1, 3, 1, 1)
     std = torch.tensor(STD, device=tensor.device).view(1, 3, 1, 1)
     return (tensor - mean) / std
-
